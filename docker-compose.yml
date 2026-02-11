@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: proxy_bot
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DB_PATH=data/bot_database.db
+    volumes:
+      - ./data:/app/data
+    stop_signal: SIGINT
