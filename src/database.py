@@ -173,3 +173,28 @@ async def delete_proxy(proxy_id: int):
         await db.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
         await db.execute("DELETE FROM user_proxy_relations WHERE proxy_id = ?", (proxy_id,))
         await db.commit()
+
+async def reset_proxy_usage(proxy_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Сбрасываем счетчик в таблице proxies
+        await db.execute("UPDATE proxies SET usage_count = 0 WHERE id = ?", (proxy_id,))
+        # Удаляем историю использования этим прокси
+        await db.execute("DELETE FROM user_proxy_relations WHERE proxy_id = ?", (proxy_id,))
+        await db.commit()
+
+async def update_proxy(proxy_id: int, location: str, server: str, port: int, secret: str):
+    unique_id = f"{server}:{port}"
+    async with aiosqlite.connect(DB_NAME) as db:
+        try:
+            await db.execute(
+                """
+                UPDATE proxies 
+                SET location = ?, server = ?, port = ?, secret = ?, unique_identifier = ?
+                WHERE id = ?
+                """,
+                (location, server, port, secret, unique_id, proxy_id)
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False

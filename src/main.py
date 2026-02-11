@@ -40,6 +40,10 @@ class AddProxyState(StatesGroup):
     waiting_for_location = State()
     confirm_notification = State()
 
+class EditProxyState(StatesGroup):
+    waiting_for_new_location = State()
+    waiting_for_new_link = State()
+
 # --- Middleware / Checks ---
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -324,37 +328,183 @@ async def list_proxies_admin(callback: types.CallbackQuery):
     proxies = await db.get_all_proxies(only_active=False)
     
     if not proxies:
-        await callback.message.answer("Прокси нет.")
+        await callback.message.edit_text("Прокси нет.", reply_markup=InlineKeyboardBuilder().button(text="🔙 Назад", callback_data="admin_panel").as_markup())
         return
 
-    text = "Управление прокси (нажмите, чтобы изменить статус):"
+    text = "select_proxy_to_manage"
     kb = InlineKeyboardBuilder()
     
     for p in proxies:
         status_icon = "✅" if p['is_active'] else "❌"
-        # Кнопка: "✅ Финляндия | 123 uses"
+        # Кнопка ведет в меню управления конкретным прокси
         label = f"{status_icon} {p['location']} | 👥 {p['usage_count']}"
-        kb.button(text=label, callback_data=f"toggle_proxy_{p['id']}")
+        kb.button(text=label, callback_data=f"manage_proxy_{p['id']}")
     
     kb.button(text="🔙 Назад", callback_data="admin_panel")
     kb.adjust(1)
     
-    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+    await callback.message.edit_text("Выберите прокси для управления:", reply_markup=kb.as_markup())
 
+async def refresh_proxy_view(callback: types.CallbackQuery, proxy_id: int):
+    proxy = await db.get_proxy_by_id(proxy_id)
+    
+    if not proxy:
+        await callback.answer("Прокси не найден", show_alert=True)
+        await list_proxies_admin(callback)
+        return
+
+    link = get_proxy_link(proxy['server'], proxy['port'], proxy['secret'])
+    status_text = "Активен ✅" if proxy['is_active'] else "Отключен ❌"
+    
+    text = (
+        f"⚙️ <b>Управление прокси: {proxy['location']}</b>\n\n"
+        f"🔗 Хост: {proxy['server']}:{proxy['port']}\n"
+        f"🔑 Секрет: {proxy['secret'][:10]}...\n"
+        f"📊 Статус: {status_text}\n"
+        f"👥 Использований: {proxy['usage_count']}\n"
+        f"🔗 <a href='{link}'>Ссылка подключения</a>"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    # Toggle Status
+    toggle_text = "🛑 Отключить" if proxy['is_active'] else "▶️ Включить"
+    kb.button(text=toggle_text, callback_data=f"toggle_proxy_{proxy['id']}")
+    
+    # Edit buttons
+    kb.button(text="✏️ Изм. Локацию", callback_data=f"edit_loc_{proxy['id']}")
+    kb.button(text="✏️ Изм. Данные (ссылку)", callback_data=f"edit_link_{proxy['id']}")
+    
+    # Reset Stats
+    kb.button(text="🔄 Сброс статистики", callback_data=f"reset_stats_{proxy['id']}")
+    
+    # Delete
+    kb.button(text="🗑 Удалить", callback_data=f"delete_proxy_confirm_{proxy['id']}")
+    
+    kb.button(text="🔙 К списку", callback_data="admin_manage_proxies")
+    kb.adjust(2, 2, 1, 1) # Grid layout
+    
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb.as_markup(), disable_web_page_preview=True)
+    except Exception:
+        await callback.answer()
+
+@dp.callback_query(F.data.startswith("manage_proxy_"))
+async def show_proxy_details(callback: types.CallbackQuery):
+    proxy_id = int(callback.data.split("_")[2])
+    await refresh_proxy_view(callback, proxy_id)
+
+# --- Toggle Status ---
 @dp.callback_query(F.data.startswith("toggle_proxy_"))
 async def toggle_proxy(callback: types.CallbackQuery):
     proxy_id = int(callback.data.split("_")[2])
-    new_status = await db.toggle_proxy_status(proxy_id)
+    await db.toggle_proxy_status(proxy_id)
+    await refresh_proxy_view(callback, proxy_id)
+
+# --- Delete Proxy ---
+@dp.callback_query(F.data.startswith("delete_proxy_confirm_"))
+async def confirm_delete_proxy(callback: types.CallbackQuery):
+    proxy_id = int(callback.data.split("_")[3])
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 ДА, УДАЛИТЬ", callback_data=f"delete_proxy_final_{proxy_id}")
+    kb.button(text="🔙 Нет, отмена", callback_data=f"manage_proxy_{proxy_id}")
     
-    if new_status is None:
-        await callback.answer("Прокси не найден", show_alert=True)
-        return
-        
-    status_text = "Активен" if new_status else "Отключен"
-    await callback.answer(f"Статус изменен на: {status_text}")
-    
-    # Обновляем список
+    await callback.message.edit_text("❓ Вы уверены, что хотите удалить этот прокси? Это действие необратимо.", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("delete_proxy_final_"))
+async def final_delete_proxy(callback: types.CallbackQuery):
+    proxy_id = int(callback.data.split("_")[3])
+    await db.delete_proxy(proxy_id)
+    await callback.answer("Прокси удален.")
     await list_proxies_admin(callback)
+
+# --- Reset Stats ---
+@dp.callback_query(F.data.startswith("reset_stats_"))
+async def reset_proxy_stats_handler(callback: types.CallbackQuery):
+    # Check if this is actually the confirm action caught by the prefix filter
+    if "confirm" in callback.data:
+        return # Skip this handler, let the next one handle it (or use better naming)
+        
+    proxy_id = int(callback.data.split("_")[2])
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, сбросить", callback_data=f"confirm_reset_stats_{proxy_id}")
+    kb.button(text="🔙 Отмена", callback_data=f"manage_proxy_{proxy_id}")
+    
+    await callback.message.edit_text("❓ Сбросить счетчик использований? История выдачи этому пользователям также будет очищена.", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("confirm_reset_stats_"))
+async def confirm_reset_stats(callback: types.CallbackQuery):
+    proxy_id = int(callback.data.split("_")[3])
+    await db.reset_proxy_usage(proxy_id)
+    await callback.answer("Статистика сброшена.")
+    await refresh_proxy_view(callback, proxy_id)
+
+# --- Edit Proxy ---
+
+@dp.callback_query(F.data.startswith("edit_loc_"))
+async def edit_proxy_location_start(callback: types.CallbackQuery, state: FSMContext):
+    proxy_id = int(callback.data.split("_")[2])
+    await state.update_data(proxy_id=proxy_id)
+    await callback.message.answer("Введите новое название локации:")
+    await state.set_state(EditProxyState.waiting_for_new_location)
+    await callback.answer()
+
+@dp.message(EditProxyState.waiting_for_new_location)
+async def edit_proxy_location_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    proxy_id = data['proxy_id']
+    new_location = message.text.strip()
+    
+    proxy = await db.get_proxy_by_id(proxy_id)
+    if proxy:
+        await db.update_proxy(proxy_id, new_location, proxy['server'], proxy['port'], proxy['secret'])
+        await message.answer(f"✅ Локация переименована в '{new_location}'")
+    
+    await state.clear()
+    
+    # Show menu again (need temporary msg or user manually navigates)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Вернуться к прокси", callback_data=f"manage_proxy_{proxy_id}")
+    await message.answer("Перейти назад:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("edit_link_"))
+async def edit_proxy_link_start(callback: types.CallbackQuery, state: FSMContext):
+    proxy_id = int(callback.data.split("_")[2])
+    await state.update_data(proxy_id=proxy_id)
+    await callback.message.answer("Отправьте новую ссылку на прокси (заменит host, port, secret):")
+    await state.set_state(EditProxyState.waiting_for_new_link)
+    await callback.answer()
+
+@dp.message(EditProxyState.waiting_for_new_link)
+async def edit_proxy_link_finish(message: types.Message, state: FSMContext):
+    link = message.text.strip()
+    data = await state.get_data()
+    proxy_id = data['proxy_id']
+    
+    try:
+        parsed = urllib.parse.urlparse(link)
+        params = urllib.parse.parse_qs(parsed.query)
+        server = params.get('server', [None])[0]
+        port = params.get('port', [None])[0]
+        secret = params.get('secret', [None])[0]
+        
+        if not (server and port and secret):
+            raise ValueError("Bad params")
+            
+        proxy = await db.get_proxy_by_id(proxy_id)
+        if proxy:
+            success = await db.update_proxy(proxy_id, proxy['location'], server, int(port), secret)
+            if success:
+                await message.answer("✅ Данные подключения обновлены.")
+            else:
+                await message.answer("⚠️ Ошибка обновления (возможно такой прокси уже есть).")
+                
+    except Exception:
+        await message.answer("❌ Некорректная ссылка.")
+        
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Вернуться к прокси", callback_data=f"manage_proxy_{proxy_id}")
+    await message.answer("Перейти назад:", reply_markup=kb.as_markup())
 
 
 async def check_new_proxies_and_notify():
